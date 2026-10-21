@@ -7,10 +7,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import datetime
 from sqlalchemy.orm import joinedload
 from .database import Base, get_db, get_engine
-from .models import Product, Party, Purchase, PurchaseLine, Sale, SaleLine, StockMovement
-from .schemas import ProductCreate, ProductRead, PartyCreate, PartyRead, PurchaseCreate, SaleCreate
+from .models import Product, Party, Purchase, PurchaseLine, Sale, SaleLine, StockMovement, User
+from .schemas import (
+    ProductCreate, ProductRead, PartyCreate, PartyRead, PurchaseCreate, SaleCreate,
+    GoogleAuthRequest, DevLoginRequest, AuthResponse, UserCreate, UserUpdate, UserRead
+)
+from .auth import (
+    get_current_user, require_role, create_access_token, verify_google_id_token
+)
 from .embeddings import embed_text, product_text, preload_model
 
 # -------------------------------------------------------------------
@@ -28,6 +35,11 @@ async def lifespan(app: FastAPI):
                 CREATE INDEX IF NOT EXISTS products_embedding_hnsw_idx
                 ON products USING hnsw (embedding vector_cosine_ops)
                 WITH (m = 16, ef_construction = 64)
+            """))
+            await conn.execute(text("""
+                INSERT INTO users (email, name, role, is_allowed)
+                VALUES ('dhyeyjoshi007@gmail.com', 'Dhyey Joshi', 'admin', TRUE)
+                ON CONFLICT (email) DO NOTHING
             """))
     except Exception as e:
         print(f"Database connection/startup note (ensure cloud DB is configured): {e}")
@@ -118,6 +130,189 @@ async def health():
 @app.get("/api/docs")
 async def api_docs():
     return RedirectResponse(url="/docs")
+
+# -------------------------------------------------------------------
+# Authentication & Whitelist Verification
+# -------------------------------------------------------------------
+@app.post("/api/auth/google", response_model=AuthResponse)
+async def auth_google(req: GoogleAuthRequest, db: AsyncSession = Depends(get_db)):
+    """Verifies Google ID token, checks user whitelist in PostgreSQL, and issues session JWT."""
+    google_profile = await verify_google_id_token(req.credential)
+    email = google_profile["email"].lower()
+    name = google_profile.get("name")
+    picture = google_profile.get("picture")
+
+    res = await db.execute(select(User).where(User.email == email))
+    user = res.scalar_one_or_none()
+
+    # Auto-seed if matches primary admin
+    initial_admin = os.getenv("INITIAL_ADMIN_EMAIL", "dhyeyjoshi007@gmail.com").strip().lower()
+    if not user and email == initial_admin:
+        user = User(
+            email=email,
+            name=name or "Dhyey Joshi",
+            picture=picture,
+            role="admin",
+            is_allowed=True,
+            last_login=datetime.utcnow(),
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+
+    if not user:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access Denied: {email} is not an authorized user. Please contact the administrator.",
+        )
+
+    if not user.is_allowed:
+        raise HTTPException(
+            status_code=403,
+            detail="Access Denied: Your account has been suspended or deactivated.",
+        )
+
+    # Update profile & login time
+    if name:
+        user.name = name
+    if picture:
+        user.picture = picture
+    user.last_login = datetime.utcnow()
+    await db.commit()
+    await db.refresh(user)
+
+    token = create_access_token({"sub": user.email, "role": user.role, "id": user.id})
+    return AuthResponse(access_token=token, user=UserRead.model_validate(user))
+
+
+@app.post("/api/auth/dev-login", response_model=AuthResponse)
+async def auth_dev_login(req: DevLoginRequest, db: AsyncSession = Depends(get_db)):
+    """Fallback sign-in for testing or initial admin setup."""
+    email = req.email.strip().lower()
+    res = await db.execute(select(User).where(User.email == email))
+    user = res.scalar_one_or_none()
+
+    initial_admin = os.getenv("INITIAL_ADMIN_EMAIL", "dhyeyjoshi007@gmail.com").strip().lower()
+    if not user and email == initial_admin:
+        user = User(
+            email=email,
+            name="Admin",
+            role="admin",
+            is_allowed=True,
+            last_login=datetime.utcnow(),
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+
+    if not user:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access Denied: {email} is not in the authorized whitelist.",
+        )
+
+    if not user.is_allowed:
+        raise HTTPException(
+            status_code=403,
+            detail="Access Denied: Account is suspended.",
+        )
+
+    user.last_login = datetime.utcnow()
+    await db.commit()
+    await db.refresh(user)
+
+    token = create_access_token({"sub": user.email, "role": user.role, "id": user.id})
+    return AuthResponse(access_token=token, user=UserRead.model_validate(user))
+
+
+@app.get("/api/auth/me", response_model=UserRead)
+async def auth_me(current_user: User = Depends(get_current_user)):
+    """Returns the authenticated user's profile."""
+    return UserRead.model_validate(current_user)
+
+
+# -------------------------------------------------------------------
+# User Management (Admin Only)
+# -------------------------------------------------------------------
+@app.get("/api/users", response_model=list[UserRead])
+async def list_users(
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(require_role(["admin"])),
+):
+    """List all authorized users and their roles (Admin only)."""
+    res = await db.execute(select(User).order_by(User.created_at.desc()))
+    return [UserRead.model_validate(u) for u in res.scalars().all()]
+
+
+@app.post("/api/users", response_model=UserRead)
+async def add_user(
+    req: UserCreate,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(require_role(["admin"])),
+):
+    """Add a new allowed email to the whitelist (Admin only)."""
+    clean_email = req.email.strip().lower()
+    existing = await db.scalar(select(User).where(User.email == clean_email))
+    if existing:
+        raise HTTPException(status_code=400, detail="User with this email already exists")
+
+    new_user = User(
+        email=clean_email,
+        name=req.name.strip() if req.name else None,
+        role=req.role,
+        is_allowed=req.is_allowed,
+    )
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+    return UserRead.model_validate(new_user)
+
+
+@app.patch("/api/users/{user_id}", response_model=UserRead)
+async def update_user(
+    user_id: int,
+    req: UserUpdate,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(require_role(["admin"])),
+):
+    """Update role or allow/revoke access for a user (Admin only)."""
+    target_user = await db.get(User, user_id)
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if target_user.id == admin_user.id and req.is_allowed is False:
+        raise HTTPException(status_code=400, detail="Cannot deactivate your own admin account")
+
+    if req.name is not None:
+        target_user.name = req.name
+    if req.role is not None:
+        target_user.role = req.role
+    if req.is_allowed is not None:
+        target_user.is_allowed = req.is_allowed
+
+    await db.commit()
+    await db.refresh(target_user)
+    return UserRead.model_validate(target_user)
+
+
+@app.delete("/api/users/{user_id}")
+async def delete_user(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(require_role(["admin"])),
+):
+    """Remove a user from the whitelist completely (Admin only)."""
+    target_user = await db.get(User, user_id)
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if target_user.id == admin_user.id:
+        raise HTTPException(status_code=400, detail="Cannot delete your own admin account")
+
+    await db.delete(target_user)
+    await db.commit()
+    return {"status": "deleted", "id": user_id}
+
 
 # -------------------------------------------------------------------
 # Dashboard

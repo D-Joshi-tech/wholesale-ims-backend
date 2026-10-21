@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
@@ -70,3 +70,38 @@ class SaleCreate(BaseModel):
     tax_mode: Literal["gst", "non_gst"] = "gst"
     lines: list[LineInput] = Field(min_length=1)
     notes: str | None = None
+
+class GoogleAuthRequest(BaseModel):
+    credential: str  # Google ID token credential
+    client_id: str | None = None
+
+class DevLoginRequest(BaseModel):
+    email: str
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: "UserRead"
+
+class UserCreate(BaseModel):
+    email: str
+    name: str | None = None
+    role: Literal["admin", "manager", "viewer"] = "viewer"
+    is_allowed: bool = True
+
+class UserUpdate(BaseModel):
+    name: str | None = None
+    role: Literal["admin", "manager", "viewer"] | None = None
+    is_allowed: bool | None = None
+
+class UserRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    email: str
+    name: str | None
+    picture: str | None
+    role: str
+    is_allowed: bool
+    created_at: datetime | None = None
+    last_login: datetime | None = None
+

@@ -99,8 +99,27 @@ CREATE TABLE IF NOT EXISTS stock_movements (
 
 CREATE INDEX IF NOT EXISTS idx_stock_movements_product_id ON stock_movements(product_id);
 
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    name VARCHAR(255),
+    picture VARCHAR(512),
+    role VARCHAR(50) DEFAULT 'viewer',
+    is_allowed BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_login TIMESTAMP WITHOUT TIME ZONE
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+-- Ensure initial admin user exists
+INSERT INTO users (email, name, role, is_allowed)
+VALUES ('dhyeyjoshi007@gmail.com', 'Dhyey Joshi', 'admin', TRUE)
+ON CONFLICT (email) DO UPDATE SET role = 'admin', is_allowed = TRUE;
+
 -- Ensure ims_user owns and has full access
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ims_user;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ims_user;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ims_user;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ims_user;
+
